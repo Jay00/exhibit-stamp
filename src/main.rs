@@ -4,8 +4,10 @@ use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use image::{Rgba, RgbaImage};
 use imageproc::drawing::{
-    draw_filled_rect_mut, draw_hollow_rect_mut, draw_line_segment_mut, draw_text_mut, text_size,
+    draw_filled_circle_mut, draw_filled_rect_mut, draw_hollow_rect_mut, draw_line_segment_mut,
+    draw_text_mut, text_size,
 };
+
 use imageproc::rect::Rect;
 use lopdf::content::{Content, Operation};
 use lopdf::{Document, Object, Stream, dictionary};
@@ -113,8 +115,8 @@ fn generate_exhibit_sticker(
     case_no: &str,
     exhibit_type: &ExhibitType,
 ) -> Result<RgbaImage, Box<dyn std::error::Error>> {
-    let width = 420;
-    let height = 210;
+    let width = 300;
+    let height = 200;
     let mut img = RgbaImage::new(width, height);
 
     // Inside generate_exhibit_sticker:
@@ -148,21 +150,21 @@ fn generate_exhibit_sticker(
     let border_thickness = 5;
 
     // 1. Fill solid opaque background within rounded rectangle
-    draw_rounded_rect(
+    draw_rounded_rect_with_border(
         &mut img,
-        pad,
-        pad,
+        pad as i32,
+        pad as i32,
         width - pad * 2,
         height - pad * 2,
         16,
-        border_color,
-        bg_color,
         border_thickness,
+        bg_color,
+        border_color,
     );
 
     // 2. Draw black section dividers
-    let line_y1 = 60.0;
-    let line_y2 = 150.0;
+    let line_y1 = 30.0;
+    let line_y2 = height as f32 - 30.0 - border_thickness as f32;
     for offset in 0..border_thickness {
         let y1 = line_y1 + offset as f32;
         let y2 = line_y2 + offset as f32;
@@ -187,7 +189,7 @@ fn generate_exhibit_sticker(
         &mut img,
         text_color,
         ((width as i32) - tw_title as i32) / 2,
-        30,
+        5 + scale_sm.y as i32,
         scale_sm,
         &font,
         title,
@@ -235,35 +237,69 @@ fn generate_exhibit_sticker(
     Ok(img)
 }
 
-fn draw_rounded_rect(
+pub fn draw_rounded_rect_filled(
     img: &mut RgbaImage,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    r: u32,
-    stroke: Rgba<u8>,
-    fill: Rgba<u8>,
-    stroke_thickness: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    radius: u32,
+    color: Rgba<u8>,
 ) {
-    // Fill interior with solid non-transparent background
+    let r = radius as i32;
+    let w = width as i32;
+    let h = height as i32;
+
+    // 1. Central vertical rectangle (spans full height minus corner radii)
     draw_filled_rect_mut(
         img,
-        Rect::at((x + r) as i32, y as i32).of_size(w - 2 * r, h),
-        fill,
-    );
-    draw_filled_rect_mut(
-        img,
-        Rect::at(x as i32, (y + r) as i32).of_size(w, h - 2 * r),
-        fill,
+        Rect::at(x, y + r).of_size(width, (height - 2 * radius) as u32),
+        color,
     );
 
-    // Draw solid black outer border with configurable thickness
-    for i in 0..stroke_thickness {
-        draw_hollow_rect_mut(
+    // 2. Central horizontal rectangle (spans full width minus corner radii)
+    draw_filled_rect_mut(
+        img,
+        Rect::at(x + r, y).of_size((width - 2 * radius) as u32, height),
+        color,
+    );
+
+    // 3. Four corner circles
+    draw_filled_circle_mut(img, (x + r, y + r), r, color); // Top-Left
+    draw_filled_circle_mut(img, (x + w - r - 1, y + r), r, color); // Top-Right
+    draw_filled_circle_mut(img, (x + r, y + h - r - 1), r, color); // Bottom-Left
+    draw_filled_circle_mut(img, (x + w - r - 1, y + h - r - 1), r, color); // Bottom-Right
+}
+
+pub fn draw_rounded_rect_with_border(
+    img: &mut RgbaImage,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    radius: u32,
+    border_thickness: u32,
+    fill_color: Rgba<u8>,
+    border_color: Rgba<u8>,
+) {
+    // Outer shape (Border)
+    draw_rounded_rect_filled(img, x, y, width, height, radius, border_color);
+
+    // Inner shape (Fill cutout)
+    let b = border_thickness as i32;
+    let inner_width = width.saturating_sub(border_thickness * 2);
+    let inner_height = height.saturating_sub(border_thickness * 2);
+    let inner_radius = radius.saturating_sub(border_thickness);
+
+    if inner_width > 0 && inner_height > 0 {
+        draw_rounded_rect_filled(
             img,
-            Rect::at((x + i) as i32, (y + i) as i32).of_size(w - 2 * i, h - 2 * i),
-            stroke,
+            x + b,
+            y + b,
+            inner_width,
+            inner_height,
+            inner_radius,
+            fill_color,
         );
     }
 }
