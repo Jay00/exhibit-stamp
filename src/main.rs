@@ -44,6 +44,14 @@ struct Args {
     /// Position Y in PDF points (1/72 inch)
     #[arg(short, long, default_value_t = 50.0)]
     y: f64,
+
+    /// Width in PDF points (1/72 inch)
+    #[arg(short, long, default_value_t = 80.0)]
+    width: f64,
+
+    /// Height in PDF points (1/72 inch)
+    #[arg(short, long, default_value_t = 50.0)]
+    height: f64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,8 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.exhibit_type,
         args.x,
         args.y,
-        80.0, // width in points
-        50.0, // height in points
+        args.width,  // width in points
+        args.height, // height in points
     )?;
 
     let output = args
