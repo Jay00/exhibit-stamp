@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use lopdf::content::{Content, Operation};
 use lopdf::{Document, Object, Stream, dictionary};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 pub enum ExhibitType {
@@ -20,7 +20,7 @@ struct Args {
     input: PathBuf,
 
     #[arg(short, long)]
-    output: PathBuf,
+    output: Option<PathBuf>,
 
     #[arg(short, long, default_value_t = 1)]
     page: u32,
@@ -28,14 +28,14 @@ struct Args {
     #[arg(value_enum, short = 't', long, default_value_t = ExhibitType::Defense)]
     exhibit_type: ExhibitType,
 
-    #[arg(short, long, default_value = "EXHIBIT 14")]
-    exhibit: String,
+    #[arg(short, long, default_value = "14")]
+    exhibit_num: String,
 
-    #[arg(long, default_value = "SUPERIOR COURT OF CALIFORNIA")]
-    title: String,
+    #[arg(long, default_value = "Defense Exhibit")]
+    header: Option<String>,
 
     #[arg(long, default_value = "CR-2026-00892")]
-    case_no: String,
+    footer: String,
 
     /// Position X in PDF points (1/72 inch)
     #[arg(short, long, default_value_t = 612.0 - 90.0)]
@@ -53,19 +53,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stamp_vector_exhibit(
         &mut doc,
         args.page,
-        &args.title,
-        &args.exhibit,
-        &args.case_no,
+        &args.header,
+        &args.exhibit_num,
+        &args.footer,
         &args.exhibit_type,
         args.x,
         args.y,
-        220.0, // width in points
-        130.0, // height in points
+        80.0, // width in points
+        50.0, // height in points
     )?;
 
-    doc.save(&args.output)?;
-    println!("Vector exhibit stamp applied cleanly to {:?}", args.output);
+    let output = args
+        .output
+        .unwrap_or_else(|| stamped_output_path(&args.input));
+    doc.save(&output)?;
+    println!("Vector exhibit stamp applied cleanly to {:?}", output);
     Ok(())
+}
+
+fn stamped_output_path(input: &Path) -> PathBuf {
+    let mut file_name = input.file_stem().unwrap_or_default().to_os_string();
+    file_name.push("_stamped");
+    if let Some(extension) = input.extension() {
+        file_name.push(".");
+        file_name.push(extension);
+    }
+    input.with_file_name(file_name)
 }
 
 /// Helper to navigate/create nested PDF dictionaries without borrow conflicts
@@ -102,9 +115,9 @@ fn get_or_create_dict(
 pub fn stamp_vector_exhibit(
     doc: &mut Document,
     page_num: u32,
-    hearing_type: &str,
-    exhibit: &str,
-    case_no: &str,
+    header: &Option<String>,
+    exhibit_num: &str,
+    footer: &str,
     exhibit_type: &ExhibitType,
     x: f64,
     y: f64,
@@ -158,8 +171,8 @@ pub fn stamp_vector_exhibit(
     ops.push(Operation::new("S", vec![]));
 
     // Horizontal Divider Lines
-    let line1_y = y + (h * 0.80);
-    let line2_y = y + (h * 0.18);
+    let line1_y = y + (h * 0.74);
+    let line2_y = y + (h * 0.26);
 
     // -------------------------------------------------------------
     // Set Divider Line Thickness (e.g., 1.5pt for a thinner line)
@@ -177,46 +190,32 @@ pub fn stamp_vector_exhibit(
     // 4. Calculate Vertically Centered Baselines for Each Zone
     // -------------------------------------------------------------
 
-    // TOP ZONE: hearing_type
+    // TOP ZONE: header
     let font_size_top = 7.0;
-    let top_zone_center = y + (h * 0.90);
+    let top_zone_center = (line1_y + y + h) / 2.0;
     let top_y = top_zone_center - (font_size_top * 0.35);
-    let top_x = center_text_offset(hearing_type, font_size_top, x, w);
 
-    // MIDDLE ZONE: Stacked Exhibit Label + Exhibit Number
-    // Determine label based on ExhibitType enum
-    let exhibit_label = match exhibit_type {
+    // The header text will usually be determined by the exhibit type, but can be overridden by the user
+    let header = header.as_deref().unwrap_or(match exhibit_type {
         ExhibitType::Defense => "DEFENSE EXHIBIT",
         ExhibitType::Government => "GOVERNMENT EXHIBIT",
-    };
+    });
 
-    let font_size_mid_label = 9.0; // Matching hearing_type / case_no size
+    let top_x = center_text_offset(header, font_size_top, x, w);
+
+    // MIDDLE ZONE: Exhibit Number (Text Centered on Stamp (Horizontally and Vertically))
+    // Font Size for the stamped exhibit number
     let font_size_mid_num = 20.0; // Large size for readability
-    let line_spacing = 7.0; // Gap between the two lines
 
-    // Total vertical span of the 2-line text block (cap-heights + gap)
-    let label_cap_h = font_size_mid_label * 0.70;
-    let num_cap_h = font_size_mid_num * 0.70;
-    let total_block_h = label_cap_h + num_cap_h + line_spacing;
+    let mid_zone_center = (line1_y + line2_y) / 2.0;
+    let mid_num_y = mid_zone_center - (font_size_mid_num * 0.35);
+    let mid_num_x = center_text_offset(exhibit_num, font_size_mid_num, x, w);
 
-    // Midpoint of the middle zone (spans between 0.18h and 0.80h)
-    let mid_zone_center = y + (h * 0.49);
-
-    // Calculate top of the text block to center both lines together
-    let block_top = mid_zone_center + (total_block_h / 2.0);
-
-    // Baselines for the two middle lines
-    let mid_label_y = block_top - label_cap_h;
-    let mid_num_y = mid_label_y - line_spacing - num_cap_h;
-
-    let mid_label_x = center_text_offset(exhibit_label, font_size_mid_label, x, w);
-    let mid_num_x = center_text_offset(exhibit, font_size_mid_num, x, w);
-
-    // BOTTOM ZONE: case_no
+    // BOTTOM ZONE: footer (can be a file name or other identifying text)
     let font_size_bot = 7.0;
-    let bot_zone_center = y + (h * 0.09);
+    let bot_zone_center = (line2_y + y) / 2.0;
     let bot_y = bot_zone_center - (font_size_bot * 0.35);
-    let bot_x = center_text_offset(case_no, font_size_bot, x, w);
+    let bot_x = center_text_offset(footer, font_size_bot, x, w);
 
     // -------------------------------------------------------------
     // 5. Draw Vector Text
@@ -227,7 +226,7 @@ pub fn stamp_vector_exhibit(
         vec![0.0.into(), 0.0.into(), 0.0.into()],
     ));
 
-    // 1. Top Zone (Hearing Type)
+    // 1. Top Zone (Header) (Exhibit Type)
     ops.push(Operation::new(
         "Tf",
         vec![
@@ -236,29 +235,9 @@ pub fn stamp_vector_exhibit(
         ],
     ));
     ops.push(Operation::new("Td", vec![top_x.into(), top_y.into()]));
-    ops.push(Operation::new(
-        "Tj",
-        vec![Object::string_literal(hearing_type)],
-    ));
+    ops.push(Operation::new("Tj", vec![Object::string_literal(header)]));
 
-    // 2. Middle Zone - Line 1 (Exhibit Type Label)
-    ops.push(Operation::new(
-        "Tf",
-        vec![
-            Object::Name(font_alias.as_bytes().to_vec()),
-            font_size_mid_label.into(),
-        ],
-    ));
-    ops.push(Operation::new(
-        "Td",
-        vec![(mid_label_x - top_x).into(), (mid_label_y - top_y).into()],
-    ));
-    ops.push(Operation::new(
-        "Tj",
-        vec![Object::string_literal(exhibit_label)],
-    ));
-
-    // 3. Middle Zone - Line 2 (Exhibit Number)
+    // 2. Middle Zone (Exhibit Number)
     ops.push(Operation::new(
         "Tf",
         vec![
@@ -268,14 +247,14 @@ pub fn stamp_vector_exhibit(
     ));
     ops.push(Operation::new(
         "Td",
-        vec![
-            (mid_num_x - mid_label_x).into(),
-            (mid_num_y - mid_label_y).into(),
-        ],
+        vec![(mid_num_x - top_x).into(), (mid_num_y - top_y).into()],
     ));
-    ops.push(Operation::new("Tj", vec![Object::string_literal(exhibit)]));
+    ops.push(Operation::new(
+        "Tj",
+        vec![Object::string_literal(exhibit_num)],
+    ));
 
-    // 4. Bottom Zone (Case Number)
+    // 3. Bottom Zone (Footer)
     ops.push(Operation::new(
         "Tf",
         vec![
@@ -287,7 +266,7 @@ pub fn stamp_vector_exhibit(
         "Td",
         vec![(bot_x - mid_num_x).into(), (bot_y - mid_num_y).into()],
     ));
-    ops.push(Operation::new("Tj", vec![Object::string_literal(case_no)]));
+    ops.push(Operation::new("Tj", vec![Object::string_literal(footer)]));
 
     ops.push(Operation::new("ET", vec![]));
     ops.push(Operation::new("Q", vec![]));
@@ -380,40 +359,67 @@ fn append_rounded_rect_path(ops: &mut Vec<Operation>, x: f64, y: f64, w: f64, h:
 //     box_x + ((box_w - approx_text_width) / 2.0).max(5.0)
 // }
 
-/// Calculates exact horizontal centering for Helvetica-Bold text in PDF points
+/// Calculates horizontal centering using Helvetica-Bold's standard glyph widths.
 fn center_text_offset(text: &str, font_size: f64, box_x: f64, box_w: f64) -> f64 {
     let text_width = measure_helvetica_bold_width(text, font_size);
-    box_x + ((box_w - text_width) / 2.0).max(0.0)
+    box_x + (box_w - text_width) / 2.0
 }
 
-/// Returns the exact width of a string in points for Helvetica-Bold
+/// Returns the width of a string in points using Helvetica-Bold AFM widths.
 fn measure_helvetica_bold_width(text: &str, font_size: f64) -> f64 {
     let total_units: u32 = text
         .chars()
         .map(|c| match c {
-            // Numbers
-            '0'..='9' => 556,
-            // Uppercase Letters
-            'A' | 'B' | 'E' | 'F' | 'K' | 'P' | 'R' => 667,
-            'C' | 'D' | 'G' | 'H' | 'N' | 'O' | 'Q' | 'U' => 722,
-            'I' => 278,
-            'J' => 500,
-            'L' => 556,
-            'M' => 833,
-            'S' => 611,
-            'T' => 611,
-            'V' | 'Y' => 667,
-            'W' => 944,
-            'X' => 667,
-            'Z' => 611,
-            // Common Punctuation & Symbols
             ' ' => 278,
+            '!' => 333,
+            '"' => 474,
+            '#' | '$' => 556,
+            '%' => 889,
+            '&' => 722,
+            '\'' => 238,
+            '(' | ')' => 333,
+            '*' => 389,
+            '+' => 584,
+            ',' | '.' => 278,
             '-' => 333,
-            '.' => 278,
-            ':' => 333,
-            '#' => 556,
             '/' => 278,
-            // Fallback for unmapped characters
+            '0'..='9' => 556,
+            ':' | ';' => 333,
+            '<' | '=' | '>' => 584,
+            '?' => 611,
+            '@' => 975,
+            'A' | 'C' | 'D' | 'U' => 722,
+            'B' | 'E' | 'P' | 'X' | 'Y' => 667,
+            'F' | 'S' => 611,
+            'G' | 'O' | 'Q' => 778,
+            'H' | 'N' | 'R' => 722,
+            'I' => 278,
+            'J' => 556,
+            'K' => 722,
+            'L' => 611,
+            'M' => 833,
+            'T' | 'Z' => 611,
+            'V' => 667,
+            'W' => 944,
+            '[' | ']' => 333,
+            '\\' => 278,
+            '^' => 584,
+            '_' => 556,
+            '`' => 333,
+            'a' | 'c' | 'e' | 's' | 'x' => 556,
+            'b' | 'n' | 'o' | 'p' | 'q' | 'u' => 611,
+            'd' | 'g' | 'h' => 611,
+            'f' | 't' => 333,
+            'i' | 'j' | 'l' => 278,
+            'k' => 556,
+            'm' => 889,
+            'r' => 389,
+            'v' | 'y' => 556,
+            'w' => 778,
+            'z' => 500,
+            '{' | '}' => 389,
+            '|' => 280,
+            '~' => 584,
             _ => 600,
         })
         .sum();
@@ -425,9 +431,32 @@ fn measure_helvetica_bold_width(text: &str, font_size: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use lopdf::{Document, Object, Stream, dictionary};
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn output_argument_is_optional_and_defaults_to_stamped_input_name() {
+        let args =
+            Args::try_parse_from(["exhibit-stamp", "--input", "records/evidence.pdf"]).unwrap();
+
+        assert_eq!(args.output, None);
+        assert_eq!(
+            stamped_output_path(&args.input),
+            PathBuf::from("records/evidence_stamped.pdf")
+        );
+
+        let args = Args::try_parse_from([
+            "exhibit-stamp",
+            "--input",
+            "records/evidence.pdf",
+            "--output",
+            "stamped.pdf",
+        ])
+        .unwrap();
+        assert_eq!(args.output, Some(PathBuf::from("stamped.pdf")));
+    }
 
     /// Helper to create a dummy PDF in memory with standard 12pt body text and 1-inch margins
     fn create_dummy_pdf() -> Document {
@@ -554,7 +583,7 @@ mod tests {
         let result = stamp_vector_exhibit(
             &mut doc,
             1,
-            "PRELIMINARY HEARING",
+            &Some("PRELIMINARY HEARING".to_owned()),
             "EXHIBIT 14",
             "CR-2026-00892",
             &ExhibitType::Defense,
@@ -584,6 +613,40 @@ mod tests {
     }
 
     #[test]
+    fn test_stamp_vector_ex() {
+        // Open PDF document for testing
+        // Open the document "test_2.pdf"
+        let mut test_2 = lopdf::Document::load("test_2.pdf").unwrap();
+
+        let initial_object_count = test_2.objects.len();
+
+        // Apply vector stamp to page 1
+
+        let result = stamp_vector_exhibit(
+            &mut test_2,
+            1,
+            &Some("Defense Exhibit".to_owned()),
+            "R14",
+            "A File Name",
+            &ExhibitType::Defense,
+            350.0,
+            50.0,
+            80.0,
+            50.0,
+        );
+        assert!(result.is_ok(), "Stamping failed: {:?}", result.err());
+
+        // Verify that new PDF objects were created (Font, Stream, etc.)
+        assert!(
+            test_2.objects.len() > initial_object_count,
+            "No new PDF objects were added to the document"
+        );
+
+        // Save the PDF to the project directory for inspection
+        test_2.save("test_2_stamped.pdf").unwrap();
+    }
+
+    #[test]
     fn test_generate_visual_pdf_outputs() {
         let output_dir = Path::new("target/test_output");
         fs::create_dir_all(output_dir).unwrap();
@@ -593,9 +656,9 @@ mod tests {
         stamp_vector_exhibit(
             &mut doc_defense,
             1,
-            "TRIAL",
-            "A",
-            "2026-CV1-99182",
+            &None,
+            "R61",
+            "File Name",
             &ExhibitType::Defense,
             500.0,
             50.0,
@@ -613,7 +676,7 @@ mod tests {
         stamp_vector_exhibit(
             &mut doc_govt,
             1,
-            "EVIDENTIARY HEARING",
+            &Some("EVIDENTIARY HEARING".to_owned()),
             "101",
             "2026-CV1-99182",
             &ExhibitType::Government,
