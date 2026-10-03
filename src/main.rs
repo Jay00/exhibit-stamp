@@ -31,19 +31,19 @@ struct Args {
     #[arg(short, long, default_value = "14")]
     exhibit_num: String,
 
-    #[arg(long, default_value = "Defense Exhibit")]
+    #[arg(long)]
     header: Option<String>,
 
     #[arg(long, default_value = "CR-2026-00892")]
     footer: String,
 
-    /// Position X in PDF points (1/72 inch)
-    #[arg(short, long, default_value_t = 612.0 - 90.0)]
-    x: f64,
+    /// Distance from the stamp's right edge to the page's right edge, in PDF points (1/72 inch)
+    #[arg(short, long, default_value_t = 10.0)]
+    right_margin: f64,
 
-    /// Position Y in PDF points (1/72 inch)
-    #[arg(short, long, default_value_t = 50.0)]
-    y: f64,
+    /// Distance from the stamp's bottom edge to the page's bottom edge, in PDF points (1/72 inch)
+    #[arg(short, long, default_value_t = 0.0)]
+    bottom_margin: f64,
 
     /// Width in PDF points (1/72 inch)
     #[arg(short, long, default_value_t = 80.0)]
@@ -65,8 +65,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.exhibit_num,
         &args.footer,
         &args.exhibit_type,
-        args.x,
-        args.y,
+        args.right_margin,
+        args.bottom_margin,
         args.width,  // width in points
         args.height, // height in points
     )?;
@@ -87,6 +87,59 @@ fn stamped_output_path(input: &Path) -> PathBuf {
         file_name.push(extension);
     }
     input.with_file_name(file_name)
+}
+
+/// Returns the (x_min, y_min, x_max, y_max) MediaBox of a page, following /Parent inheritance.
+fn page_media_box(
+    doc: &Document,
+    page_id: lopdf::ObjectId,
+) -> Result<[f64; 4], Box<dyn std::error::Error>> {
+    let mut current = page_id;
+    loop {
+        let dict = doc.get_object(current)?.as_dict()?;
+        if let Ok(obj) = dict.get(b"MediaBox") {
+            let obj = match obj {
+                Object::Reference(id) => doc.get_object(*id)?,
+                other => other,
+            };
+            let nums: Vec<f64> = obj
+                .as_array()?
+                .iter()
+                .map(|o| match o {
+                    Object::Integer(i) => Ok(*i as f64),
+                    Object::Real(r) => Ok(*r as f64),
+                    _ => Err("Invalid MediaBox entry"),
+                })
+                .collect::<Result<_, _>>()?;
+            if nums.len() != 4 {
+                return Err("MediaBox must have 4 entries".into());
+            }
+            return Ok([nums[0], nums[1], nums[2], nums[3]]);
+        }
+        current = dict.get(b"Parent")?.as_reference()?;
+    }
+}
+
+/// Returns the page's /Rotate value normalized to 0, 90, 180 or 270, following /Parent inheritance.
+fn page_rotation(doc: &Document, page_id: lopdf::ObjectId) -> i64 {
+    let mut current = page_id;
+    while let Ok(dict) = doc.get_object(current).and_then(|o| o.as_dict()) {
+        if let Ok(obj) = dict.get(b"Rotate") {
+            let obj = match obj {
+                Object::Reference(id) => doc.get_object(*id).unwrap_or(obj),
+                other => other,
+            };
+            if let Object::Integer(r) = obj {
+                return r.rem_euclid(360);
+            }
+            return 0;
+        }
+        match dict.get(b"Parent").and_then(|p| p.as_reference()) {
+            Ok(parent) => current = parent,
+            Err(_) => break,
+        }
+    }
+    0
 }
 
 /// Helper to navigate/create nested PDF dictionaries without borrow conflicts
@@ -127,13 +180,33 @@ pub fn stamp_vector_exhibit(
     exhibit_num: &str,
     footer: &str,
     exhibit_type: &ExhibitType,
-    x: f64,
-    y: f64,
+    right_margin: f64,
+    bottom_margin: f64,
     w: f64,
     h: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pages = doc.get_pages();
     let page_id = *pages.get(&page_num).ok_or("Page index out of bounds")?;
+
+    let [x_min, y_min, x_max, y_max] = page_media_box(doc, page_id)?;
+    let (x_min, x_max) = (x_min.min(x_max), x_min.max(x_max));
+    let (y_min, y_max) = (y_min.min(y_max), y_min.max(y_max));
+
+    // Stamp is laid out in the visual (rotated) page space, then mapped to user space with a `cm`.
+    let rotation = page_rotation(doc, page_id);
+    let (visual_w, _visual_h) = if rotation % 180 == 0 {
+        (x_max - x_min, y_max - y_min)
+    } else {
+        (y_max - y_min, x_max - x_min)
+    };
+    let matrix: [f64; 6] = match rotation {
+        90 => [0.0, 1.0, -1.0, 0.0, x_max, y_min],
+        180 => [-1.0, 0.0, 0.0, -1.0, x_max, y_max],
+        270 => [0.0, -1.0, 1.0, 0.0, x_min, y_max],
+        _ => [1.0, 0.0, 0.0, 1.0, x_min, y_min],
+    };
+    let x = visual_w - right_margin - w;
+    let y = bottom_margin;
 
     // 1. Register a standard Helvetica-Bold font in Page Resources
     let font_alias = "StampFontBold";
@@ -160,6 +233,10 @@ pub fn stamp_vector_exhibit(
     // 3. Build Vector Graphics Operators
     let mut ops = Vec::new();
     ops.push(Operation::new("q", vec![])); // Push graphics state
+    ops.push(Operation::new(
+        "cm",
+        matrix.iter().map(|v| (*v).into()).collect(),
+    ));
 
     // Background Fill
     ops.push(Operation::new(
@@ -199,7 +276,7 @@ pub fn stamp_vector_exhibit(
     // -------------------------------------------------------------
 
     // TOP ZONE: header
-    let font_size_top = 7.0;
+    let font_size_top = 6.0;
     let top_zone_center = (line1_y + y + h) / 2.0;
     let top_y = top_zone_center - (font_size_top * 0.35);
 
@@ -220,7 +297,7 @@ pub fn stamp_vector_exhibit(
     let mid_num_x = center_text_offset(exhibit_num, font_size_mid_num, x, w);
 
     // BOTTOM ZONE: footer (can be a file name or other identifying text)
-    let font_size_bot = 7.0;
+    let font_size_bot = 6.0;
     let bot_zone_center = (line2_y + y) / 2.0;
     let bot_y = bot_zone_center - (font_size_bot * 0.35);
     let bot_x = center_text_offset(footer, font_size_bot, x, w);
@@ -283,20 +360,20 @@ pub fn stamp_vector_exhibit(
     let stamp_stream = Stream::new(dictionary! {}, Content { operations: ops }.encode()?);
     let stamp_stream_id = doc.add_object(stamp_stream);
 
+    // Isolate the original content so unbalanced `cm`/`q` in it can't transform the stamp.
+    let save_id = doc.add_object(Stream::new(dictionary! {}, b"q\n".to_vec()));
+    let restore_id = doc.add_object(Stream::new(dictionary! {}, b"\nQ\n".to_vec()));
+
     let page_dict = doc.get_object_mut(page_id)?.as_dict_mut()?;
-    match page_dict.get_mut(b"Contents") {
-        Ok(Object::Array(contents)) => contents.push(Object::Reference(stamp_stream_id)),
-        Ok(Object::Reference(id)) => {
-            let existing_ref = Object::Reference(*id);
-            page_dict.set(
-                "Contents",
-                vec![existing_ref, Object::Reference(stamp_stream_id)],
-            );
-        }
-        _ => {
-            page_dict.set("Contents", vec![Object::Reference(stamp_stream_id)]);
-        }
-    }
+    let mut contents = match page_dict.get(b"Contents") {
+        Ok(Object::Array(existing)) => existing.clone(),
+        Ok(Object::Reference(id)) => vec![Object::Reference(*id)],
+        _ => vec![],
+    };
+    contents.insert(0, Object::Reference(save_id));
+    contents.push(Object::Reference(restore_id));
+    contents.push(Object::Reference(stamp_stream_id));
+    page_dict.set("Contents", contents);
 
     Ok(())
 }
@@ -595,8 +672,8 @@ mod tests {
             "EXHIBIT 14",
             "CR-2026-00892",
             &ExhibitType::Defense,
-            350.0,
-            50.0,
+            10.0,
+            0.0,
             220.0,
             130.0,
         );
@@ -637,8 +714,8 @@ mod tests {
             "R14",
             "A File Name",
             &ExhibitType::Defense,
-            350.0,
-            50.0,
+            10.0,
+            0.0,
             80.0,
             50.0,
         );
@@ -668,8 +745,8 @@ mod tests {
             "R61",
             "File Name",
             &ExhibitType::Defense,
-            500.0,
-            50.0,
+            10.0,
+            0.0,
             90.0,
             60.0,
         )
@@ -688,8 +765,8 @@ mod tests {
             "101",
             "2026-CV1-99182",
             &ExhibitType::Government,
-            00.0, // Placed at bottom-left corner
-            00.0,
+            10.0,
+            0.0,
             90.0,
             60.0,
         )
